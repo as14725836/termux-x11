@@ -1,0 +1,242 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Gradle 构建类型'
+        type: choice
+        options: [debug, release]
+        default: debug
+      make_release:
+        description: '构建成功后创建 GitHub Release'
+        type: boolean
+        default: true
+      release_tag:
+        description: 'Release tag（留空=自动 termux-x11-<日期>-<sha>）'
+        type: string
+        default: ''
+      submodule_retries:
+        description: 'submodule 拉取重试次数'
+        type: string
+        default: '3'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: "Build termux-x11 APK"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      - name: Show repo info
+        run: |
+          echo "=== HEAD ==="
+          git log -1 --pretty='%H %s' || true
+          echo "=== 短 sha ==="
+          echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "FULL_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "=== .gitmodules 一览 ==="
+          git config -f .gitmodules --get-regexp '^submodule\..*\.path$' || true
+
+      - name: Java setup
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Restore Gradle cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            .git/modules
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '.gitmodules', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Fetch submodules (with retry)
+        shell: bash
+        run: |
+          set -u
+          TRIES=${{ inputs.submodule_retries }}
+          for i in $(seq 1 "$TRIES"); do
+            echo "===== submodule 拉取尝试 $i/$TRIES ====="
+            if git submodule update --init --recursive --jobs 4 --depth 1; then
+              echo "✅ submodule 全部拉取成功"
+              break
+            fi
+            echo "⚠️ 第 $i 次失败，清理后重试"
+            git submodule deinit -f --all 2>/dev/null || true
+            git submodule sync --recursive || true
+            sleep $((i * 10))
+            if [ "$i" = "$TRIES" ]; then
+              echo "❌ submodule 拉取 $TRIES 次都失败"
+              exit 1
+            fi
+          done
+          echo "=== submodule 状态 ==="
+          git submodule status --recursive || true
+
+      - name: Verify submodules present
+        shell: bash
+        run: |
+          MISSING=""
+          for d in $(git config -f .gitmodules --get-regexp '^submodule\..*\.path$' | awk '{print $2}'); do
+            if [ ! -e "$d" ] || [ -z "$(ls -A "$d" 2>/dev/null)" ]; then
+              MISSING="$MISSING $d"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "❌ 以下 submodule 目录为空或不存在:$MISSING"
+            exit 1
+          fi
+          echo "✅ 所有 submodule 目录都已填充"
+
+      - name: Install Android NDK
+        id: ndk
+        shell: bash
+        run: |
+          set -eu
+          NDK_VER=$(grep -oE 'termuxX11NdkVersion *= *"[^"]+"' lorie/version.gradle | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "NDK 版本（来自 lorie/version.gradle）: $NDK_VER"
+          echo "ndk_ver=$NDK_VER" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$NDK_VER" ]; then
+            echo "❌ 没能解析出 NDK 版本"
+            exit 1
+          fi
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "SDK_ROOT=$SDK_ROOT"
+          if [ ! -d "$SDK_ROOT" ]; then
+            echo "❌ 找不到 Android SDK: $SDK_ROOT"
+            exit 1
+          fi
+
+          SDKM="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SDKM" ]; then
+            echo "用 sdkmanager 安装 ndk;$NDK_VER ..."
+            yes | "$SDKM" --install "ndk;$NDK_VER" || true
+          else
+            echo "⚠️ 找不到 sdkmanager: $SDKM"
+          fi
+
+          if [ ! -d "$SDK_ROOT/ndk/$NDK_VER" ]; then
+            echo "⚠️ sdkmanager 未装成功，直接下载 NDK r29 zip 兜底"
+            curl -fsSL --retry 3 -o /tmp/ndk.zip "https://dl.google.com/android/repository/android-ndk-r29-linux.zip"
+            mkdir -p "$SDK_ROOT/ndk"
+            unzip -q /tmp/ndk.zip -d "$SDK_ROOT/ndk"
+            # 解压出来的目录名可能是 android-ndk-r29 或 android-ndk-r29-betaN
+            SRC_DIR=$(find "$SDK_ROOT/ndk" -maxdepth 1 -type d -name 'android-ndk-r29*' | head -1)
+            if [ -n "$SRC_DIR" ]; then
+              rm -rf "$SDK_ROOT/ndk/$NDK_VER"
+              mv "$SRC_DIR" "$SDK_ROOT/ndk/$NDK_VER"
+            fi
+          fi
+          echo "=== ndk 目录现有版本 ==="
+          ls -1 "$SDK_ROOT/ndk" 2>/dev/null || true
+
+          test -d "$SDK_ROOT/ndk/$NDK_VER" || { echo "❌ NDK 安装失败"; exit 1; }
+          echo "✅ NDK: $SDK_ROOT/ndk/$NDK_VER"
+          echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/$NDK_VER" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$SDK_ROOT/ndk/$NDK_VER" >> "$GITHUB_ENV"
+
+      - name: Gradle wrapper validation
+        uses: gradle/actions/wrapper-validation@v4
+        continue-on-error: true
+
+      - name: Grant gradlew
+        run: chmod +x ./gradlew
+
+      - name: Build
+        shell: bash
+        env:
+          CURRENT_COMMIT: ${{ github.sha }}
+        run: |
+          set -o pipefail
+          BT="${{ inputs.build_type }}"
+          if [ "$BT" = "release" ]; then
+            TASK="assembleRelease"
+          else
+            TASK="assembleDebug"
+          fi
+          echo "===== ./gradlew $TASK ====="
+          ./gradlew --no-daemon --stacktrace "$TASK" 2>&1 | tee /tmp/gradle.out
+          echo "===== 构建结束 ====="
+          tail -20 /tmp/gradle.out || true
+
+      - name: Collect outputs
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p /tmp/apk-out
+          echo "=== 搜索所有 APK ==="
+          find . -name '*.apk' -type f 2>/dev/null | sort || true
+          find . -name '*.apk' -type f -exec cp -v {} /tmp/apk-out/ \; 2>/dev/null || true
+
+          echo "=== 搜索 companion 包 ==="
+          find . \( -name '*.deb' -o -name '*.pkg.tar.xz' \) -type f -exec cp -v {} /tmp/apk-out/ \; 2>/dev/null || true
+
+          echo "=== 收集到的文件 ==="
+          ls -la /tmp/apk-out/ || true
+
+      - name: Upload APKs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: termux-x11-apk-${{ env.SHORT_SHA }}
+          path: /tmp/apk-out/*
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload gradle log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-log-${{ env.SHORT_SHA }}
+          path: /tmp/gradle.out
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Compute release tag
+        id: tag
+        if: success() && inputs.make_release
+        shell: bash
+        run: |
+          T="${{ inputs.release_tag }}"
+          if [ -z "$T" ]; then
+            T="termux-x11-$(date -u +%Y%m%d)-${SHORT_SHA}"
+          fi
+          echo "tag=$T" >> "$GITHUB_OUTPUT"
+          echo "将使用 tag: $T"
+
+      - name: Create GitHub Release
+        if: success() && inputs.make_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: termux-x11 ${{ steps.tag.outputs.tag }}
+          body: |
+            termux-x11 APK 构建
+            - commit: `${{ github.sha }}`
+            - 分支: `${{ github.ref_name }}`
+            - 构建类型: `${{ inputs.build_type }}`
+            - NDK: `${{ steps.ndk.outputs.ndk_ver }}`
+            - 时间: ${{ github.run_id }}
+          files: /tmp/apk-out/*
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: false
