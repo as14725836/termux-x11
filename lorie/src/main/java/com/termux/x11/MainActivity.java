@@ -29,6 +29,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.ParcelFileDescriptor;
+import android.os.RemoteException;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.DisplayMetrics;
@@ -43,6 +44,7 @@ import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.OrientationEventListener;
 import android.view.PointerIcon;
+import android.view.Surface;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
@@ -109,6 +111,11 @@ public class MainActivity extends AppCompatActivity {
     private Rect orientationDeniedAt = null;
     private String screenIdleTimeoutArmedMode = null; // numeric screenIdleTimeout mode the pending idle check reflects, or null if none pending
     private final Runnable screenIdleTimeoutCheck = this::checkScreenIdleTimeout;
+    private static final long SERVER_WATCHDOG_INTERVAL_MS = 200, SERVER_HEARTBEAT_TIMEOUT_MS = 3000;
+    private final Runnable serverWatchdog = this::checkServerHeartbeat;
+    @Keep private long lastServerHeartbeat;
+    private boolean surfacePending;
+    private long lastServerWatchdogRun;
     /** Aspect ratios outside of the range the device is configured with are rejected by the system. */
     private static final float MIN_PIP_ASPECT_RATIO = getSystemDimenFloat("config_pictureInPictureMinAspectRatio", 1.f / 2.39f);
     private static final float MAX_PIP_ASPECT_RATIO = getSystemDimenFloat("config_pictureInPictureMaxAspectRatio", 2.39f);
@@ -414,6 +421,7 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         handler.removeCallbacks(screenIdleTimeoutCheck);
+        handler.removeCallbacks(serverWatchdog);
         if (mInputHandler != null)
             mInputHandler.onDestroy();
         instances.values().removeIf(ref -> ref.get() == this);
@@ -558,9 +566,18 @@ public class MainActivity extends AppCompatActivity {
         return result;
     }
 
+    private void positionNoServerSignal() {
+        final View parent = (View) frm.getParent();
+        final RectF rect = getVisibleFrmRect();
+        final View overlay = findViewById(R.id.no_server_signal);
+        overlay.setTranslationX(rect.centerX() - parent.getWidth() / 2f);
+        overlay.setTranslationY(rect.bottom - parent.getHeight() - 12 * getResources().getDisplayMetrics().density);
+    }
+
     private void makeSureHelpersAreVisibleAndInScreenBounds() {
         final ViewPager pager = getTerminalToolbarViewPager();
         final RectF frmRect = getVisibleFrmRect();
+        positionNoServerSignal();
         View mouseAuxButtons = findViewById(R.id.mouse_buttons);
         View stylusAuxButtons = findViewById(R.id.mouse_helper_visibility);
 
@@ -709,6 +726,20 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    /** The X server draws into the surface itself. */
+    void windowChanged(Surface surface) {
+        // The call waits for the server to take the surface, which a stalled one never does.
+        surfacePending = serverStalled();
+        if (service == null || surfacePending)
+            return;
+
+        try {
+            service.windowChanged(surface);
+        } catch (RemoteException e) {
+            Log.e("MainActivity", "Failed to hand the surface over to the X server", e);
+        }
+    }
+
     void disconnectService() {
         service = null;
 
@@ -733,9 +764,10 @@ public class MainActivity extends AppCompatActivity {
             if (fd != null) {
                 Log.v("MainActivity", "Extracting X connection socket.");
                 getLorieView().connect(fd.detachFd());
+                clientConnectedStateChanged();
+                getLorieView().sendSurface();
                 finishStartupDraw();
                 getLorieView().triggerCallback();
-                clientConnectedStateChanged();
                 getLorieView().reloadPreferences(prefs);
             } else
                 scheduleConnect();
@@ -815,6 +847,28 @@ public class MainActivity extends AppCompatActivity {
         orientationListener.enable();
         setTerminalToolbarView();
         getLorieView().requestFocus();
+
+        lastServerHeartbeat = lastServerWatchdogRun = SystemClock.uptimeMillis();
+        handler.postDelayed(serverWatchdog, SERVER_WATCHDOG_INTERVAL_MS);
+    }
+
+    private boolean serverStalled() {
+        return getLorieView().connected() && SystemClock.uptimeMillis() - lastServerHeartbeat > SERVER_HEARTBEAT_TIMEOUT_MS;
+    }
+
+    private void checkServerHeartbeat() {
+        long now = SystemClock.uptimeMillis();
+        // A late run means this thread was stalled, so queued heartbeats have not been read yet.
+        if (now - lastServerWatchdogRun > SERVER_HEARTBEAT_TIMEOUT_MS / 2)
+            lastServerHeartbeat = now;
+        lastServerWatchdogRun = now;
+
+        boolean stalled = serverStalled();
+        if (surfacePending && !stalled)
+            getLorieView().sendSurface();
+        positionNoServerSignal();
+        findViewById(R.id.no_server_signal).setVisibility(stalled ? View.VISIBLE : View.GONE);
+        handler.postDelayed(serverWatchdog, SERVER_WATCHDOG_INTERVAL_MS);
     }
 
     @Override
@@ -826,6 +880,8 @@ public class MainActivity extends AppCompatActivity {
 
         getLorieView().setKeyboardVisible(false);
 
+        handler.removeCallbacks(serverWatchdog);
+        findViewById(R.id.no_server_signal).setVisibility(View.GONE);
         orientationListener.disable();
         super.onPause();
 
@@ -1228,6 +1284,7 @@ public class MainActivity extends AppCompatActivity {
     void clientConnectedStateChanged() {
         runOnUiThread(()-> {
             boolean connected = getLorieView().connected();
+            lastServerHeartbeat = SystemClock.uptimeMillis();
             if (!connected)
                 setCapturingEnabled(false);
 
@@ -1241,6 +1298,7 @@ public class MainActivity extends AppCompatActivity {
             setTerminalToolbarView();
             findViewById(R.id.mouse_buttons).setVisibility(prefs.showMouseHelper.get() && "1".equals(prefs.touchMode.get()) && connected ? View.VISIBLE : View.GONE);
             findViewById(R.id.stub).setVisibility(connected?View.INVISIBLE:View.VISIBLE);
+            findViewById(R.id.no_server_signal).setVisibility(View.GONE);
             getLorieView().setVisibility(connected?View.VISIBLE:View.INVISIBLE);
 
             // We should recover connection in the case if file descriptor for some reason was broken...

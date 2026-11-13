@@ -44,23 +44,7 @@ struct LorieBuffer {
     GLuint id;
     EGLImage image;
     struct xorg_list link;
-
-    int32_t gpuCopyPending;
 };
-
-void LorieBuffer_gpuCopyPendingInc(LorieBuffer* buffer) {
-    if (buffer)
-        buffer->gpuCopyPending++;
-}
-
-void LorieBuffer_gpuCopyPendingDec(LorieBuffer* buffer) {
-    if (buffer)
-        buffer->gpuCopyPending--;
-}
-
-bool LorieBuffer_hasGpuCopyPending(LorieBuffer* buffer) {
-    return buffer && buffer->gpuCopyPending;
-}
 
 __attribute__((unused))
 static int memfd_create(const char *name, unsigned int flags) {
@@ -291,11 +275,8 @@ __LIBC_HIDDEN__ void __LorieBuffer_free(LorieBuffer* buffer) {
 
     xorg_list_del(&buffer->link);
 
-    if (eglGetCurrentContext())
-        glDeleteTextures(1, &buffer->id);
-
-    if (eglGetCurrentDisplay() && buffer->image)
-        eglDestroyImageKHR(eglGetCurrentDisplay(), buffer->image);
+    if (buffer->locked)
+        LorieBuffer_unlock(buffer);
 
     switch (buffer->desc.type) {
         case LORIEBUFFER_REGULAR:
@@ -347,6 +328,10 @@ __LIBC_HIDDEN__ int LorieBuffer_lock(LorieBuffer* buffer, void** out) {
     return ret;
 }
 
+__LIBC_HIDDEN__ bool LorieBuffer_isLocked(LorieBuffer* buffer) {
+    return buffer && buffer->locked;
+}
+
 __LIBC_HIDDEN__ int LorieBuffer_unlock(LorieBuffer* buffer) {
     int ret = 0;
     if (!buffer)
@@ -389,13 +374,13 @@ __LIBC_HIDDEN__ void LorieBuffer_recvHandleFromUnixSocket(int socketFd, LorieBuf
 
     // Reset process-specific data;
     buffer.refcount = 0;
-    buffer.locked = false;
     buffer.fd = -1;
-    buffer.lockedData = NULL;
     __sync_fetch_and_add(&buffer.refcount, 1); // refcount is the first object in the struct
 
     read(socketFd, &buffer, sizeof(buffer));
     buffer.image = NULL; // Only for process-local use
+    buffer.locked = false;
+    buffer.lockedData = NULL;
     if (buffer.desc.type == LORIEBUFFER_FD) {
         size_t size = buffer.desc.stride * buffer.desc.height * sizeof(uint32_t);
         buffer.fd = ancil_recv_fd(socketFd);
@@ -456,9 +441,21 @@ __LIBC_HIDDEN__ void LorieBuffer_attachToGL(LorieBuffer* buffer) {
         glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, buffer->image);
     else if (buffer->desc.data && buffer->desc.width > 0 && buffer->desc.height > 0) {
         int format = buffer->desc.format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ? GL_BGRA_EXT : GL_RGBA;
-        // The image will be updated in redraw call because of `drawRequested` flag, so we are not uploading pixels
+        // The renderer uploads the whole image the first time it draws the buffer, so we are not uploading pixels
         glTexImage2D(GL_TEXTURE_2D, 0, format, buffer->desc.stride, buffer->desc.height, 0, format, GL_UNSIGNED_BYTE, NULL);
     }
+}
+
+__LIBC_HIDDEN__ void LorieBuffer_detachFromGL(LorieBuffer* buffer) {
+    if (!buffer)
+        return;
+
+    glDeleteTextures(1, &buffer->id);
+    buffer->id = 0;
+
+    if (buffer->image)
+        eglDestroyImageKHR(eglGetCurrentDisplay(), buffer->image);
+    buffer->image = NULL;
 }
 
 __LIBC_HIDDEN__ void LorieBuffer_bindTexture(LorieBuffer *buffer) {
@@ -466,8 +463,13 @@ __LIBC_HIDDEN__ void LorieBuffer_bindTexture(LorieBuffer *buffer) {
         return;
 
     glBindTexture(GL_TEXTURE_2D, buffer->id);
-    if (buffer->desc.type == LORIEBUFFER_FD)
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, buffer->desc.stride, buffer->desc.height, buffer->desc.format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ? GL_BGRA_EXT : GL_RGBA, GL_UNSIGNED_BYTE, buffer->desc.data);
+}
+
+__LIBC_HIDDEN__ void LorieBuffer_uploadRows(LorieBuffer *buffer, int y1, int y2) {
+    if (!buffer || buffer->desc.type != LORIEBUFFER_FD)
+        return;
+
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y1, buffer->desc.stride, y2 - y1, buffer->desc.format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ? GL_BGRA_EXT : GL_RGBA, GL_UNSIGNED_BYTE, (uint32_t*) buffer->desc.data + (size_t) y1 * buffer->desc.stride);
 }
 
 __LIBC_HIDDEN__ unsigned int LorieBuffer_getGLTextureId(LorieBuffer *buffer) {
@@ -511,6 +513,11 @@ int LorieBuffer_recvAHardwareBufferHandleFromUnixSocket(int socketFd, AHardwareB
 void LorieBuffer_describeAHardwareBuffer(AHardwareBuffer* buffer, AHardwareBuffer_Desc* outDesc) {
     if (__builtin_available(android 26, *))
         AHardwareBuffer_describe(buffer, outDesc);
+}
+
+void LorieBuffer_releaseAHardwareBuffer(AHardwareBuffer* buffer) {
+    if (__builtin_available(android 26, *))
+        AHardwareBuffer_release(buffer);
 }
 
 __LIBC_HIDDEN__ int ancil_send_fd(int sock, int fd) {

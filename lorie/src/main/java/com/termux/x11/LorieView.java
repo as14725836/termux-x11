@@ -159,6 +159,13 @@ public class LorieView extends SurfaceView implements InputStub {
             LorieView.this.sendKeyEvent(0, k, false);
         }
 
+        void sendKeysWithoutCtrlAlt(Runnable keys) {
+            if (activity.mExtraKeys != null)
+                activity.mExtraKeys.withoutCtrlAlt(keys);
+            else
+                keys.run();
+        }
+
         @Override public boolean deleteSurroundingText(int beforeLength, int afterLength) {
             if (requestedPos != -1 && requestedPos > currentPos && beforeLength > 0) {
                 // sometimes gboard sees following whitespace and wants to remove it.
@@ -175,16 +182,22 @@ public class LorieView extends SurfaceView implements InputStub {
                 keyReleaseHandler.removeMessages(KeyEvent.KEYCODE_DEL);
             }
 
-            for (int i=0; i<beforeLength; i++)
-                sendKey(KeyEvent.KEYCODE_DEL);
-            for (int i=0; i<afterLength; i++)
-                sendKey(KeyEvent.KEYCODE_FORWARD_DEL);
+            sendKeysWithoutCtrlAlt(() -> {
+                for (int i=0; i<beforeLength; i++)
+                    sendKey(KeyEvent.KEYCODE_DEL);
+                for (int i=0; i<afterLength; i++)
+                    sendKey(KeyEvent.KEYCODE_FORWARD_DEL);
+            });
 
             currentPos -= beforeLength;
             if (currentPos <= 1)
                 resetCursorPosition = true;
 
             return true;
+        }
+
+        @Override public boolean deleteSurroundingTextInCodePoints(int beforeLength, int afterLength) {
+            return deleteSurroundingText(beforeLength, afterLength);
         }
 
         /**
@@ -222,9 +235,9 @@ public class LorieView extends SurfaceView implements InputStub {
             if (mBatchEditNesting == 0) { // outside of batchedit so most likely cursor control
                 if (start == end) {
                     if (start < 1)
-                        sendKey(KeyEvent.KEYCODE_DPAD_LEFT);
+                        sendKeysWithoutCtrlAlt(() -> sendKey(KeyEvent.KEYCODE_DPAD_LEFT));
                     else if (start > 1)
-                        sendKey(KeyEvent.KEYCODE_DPAD_RIGHT);
+                        sendKeysWithoutCtrlAlt(() -> sendKey(KeyEvent.KEYCODE_DPAD_RIGHT));
                 }
 
                 mIMM.updateSelection(LorieView.this, -1, -1, -1, -1);
@@ -285,7 +298,7 @@ public class LorieView extends SurfaceView implements InputStub {
         @Override public void surfaceCreated(@NonNull SurfaceHolder holder) {}
 
         @Override public void surfaceChanged(@NonNull SurfaceHolder holder, int f, int width, int height) {
-            LorieView.this.surfaceChanged(mNativeContext, holder.getSurface());
+            activity.windowChanged(holder.getSurface());
             width = getMeasuredWidth();
             height = getMeasuredHeight();
 
@@ -294,7 +307,7 @@ public class LorieView extends SurfaceView implements InputStub {
         }
 
         @Override public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
-            LorieView.this.surfaceChanged(mNativeContext, null);
+            activity.windowChanged(null);
         }
     };
 
@@ -328,6 +341,13 @@ public class LorieView extends SurfaceView implements InputStub {
     public void setCallback(Callback callback) {
         mCallback = callback;
         triggerCallback();
+    }
+
+    /** Hands the surface over to the X server that has missed it. */
+    void sendSurface() {
+        Surface surface = getHolder().getSurface();
+        activity.windowChanged(surface != null && surface.isValid() ? surface : null);
+        updateViewport();
     }
 
     public void triggerCallback() {
@@ -688,7 +708,6 @@ public class LorieView extends SurfaceView implements InputStub {
 
     @FastNative private native long nativeInit();
     @FastNative private native void nativeDestroy(long ptr);
-    @FastNative private native void surfaceChanged(long ptr, Surface surface);
     @FastNative private native void setFiltering(long ptr, int filtering);
     @FastNative private native void setClipboardSyncEnabled(long ptr, boolean enabled, boolean ignored);
     @FastNative private native void sendClipboardAnnounce(long ptr);
@@ -807,6 +826,8 @@ public class LorieView extends SurfaceView implements InputStub {
 
     @CriticalNative public static native long getLastInputTimestamp();
     @CriticalNative public static native void markUserActivity();
+
+    static class CriticalNativeProbe { @CriticalNative static native boolean probe(long value); }
 
     static {
         System.loadLibrary("Xlorie");
