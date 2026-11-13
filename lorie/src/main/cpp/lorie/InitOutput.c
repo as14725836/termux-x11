@@ -22,6 +22,9 @@
 #include <linux/futex.h>
 #include <present.h>
 #include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdlib.h>
 #include <dri3.h>
 #include <sys/stat.h>
 #include <dlfcn.h>
@@ -1175,8 +1178,64 @@ static int lorieGetModifiers(__unused ScreenPtr screen, uint32_t format, uint32_
     return TRUE;
 }
 
+/* DRI3 open_client: hand the client a GPU fd.
+ *
+ * Historically this screen did not implement open/open_client at all, so
+ * dri3_open() fell through to BadMatch.  That made every DRI3-capable client
+ * (Mesa GLX/EGL with a real driver) bail out and fall back to a software
+ * screen.  On the kgsl stack there is no DRM render node to hand out, so we
+ * pass the Adreno kgsl char device instead; Mesa's freedreno kgsl backend
+ * accepts it (FD_FORCE_KGSL / drmGetVersion-less probing) and keeps it as the
+ * device control/identity fd.
+ *
+ * LORIE_DRI3_OPEN lets users select the node explicitly.  When unset we try,
+ * in order: the node lorie already holds open (if any), then
+ * /dev/kgsl-3d0, then the first readable /dev/dri/renderD*.
+ */
+static int lorieDri3OpenClient(__unused ClientPtr client, __unused ScreenPtr screen,
+                               __unused RRProviderPtr provider, int *fd) {
+    static const char *const candidates[] = {
+            "/dev/kgsl-3d0",
+            "/dev/dri/renderD128",
+            "/dev/dri/renderD129",
+            "/dev/dri/card0",
+    };
+    const char *env = getenv("LORIE_DRI3_OPEN");
+    int out = -1;
+
+    if (env && *env) {
+        out = open(env, O_RDWR | O_CLOEXEC);
+        if (out < 0)
+            out = open(env, O_RDONLY | O_CLOEXEC);
+        if (out < 0) {
+            log(ERROR, "DRI3: LORIE_DRI3_OPEN=%s open failed: %s", env, strerror(errno));
+            return BadAlloc;
+        }
+        log(INFO, "DRI3: opened %s for client (fd %d)", env, out);
+    } else {
+        for (unsigned i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+            out = open(candidates[i], O_RDWR | O_CLOEXEC);
+            if (out < 0)
+                out = open(candidates[i], O_RDONLY | O_CLOEXEC);
+            if (out >= 0) {
+                log(INFO, "DRI3: opened %s for client (fd %d)", candidates[i], out);
+                break;
+            }
+        }
+    }
+
+    if (out < 0) {
+        log(ERROR, "DRI3: no GPU node could be opened for the client");
+        return BadAlloc;
+    }
+
+    *fd = out;
+    return Success;
+}
+
 static dri3_screen_info_rec lorieDri3Info = {
         .version = 2,
+        .open_client = lorieDri3OpenClient,
         .fds_from_pixmap = FalseNoop,
         .pixmap_from_fds = loriePixmapFromFds,
         .get_formats = lorieGetFormats,
