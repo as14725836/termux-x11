@@ -117,6 +117,16 @@ STATIC_INLINE void LorieBuffer_release(LorieBuffer* _Nullable buffer) {
 const LorieBuffer_Desc* _Nonnull LorieBuffer_description(LorieBuffer* _Nullable buffer);
 
 /**
+ * Returns a newly duplicated file descriptor for the memory backing this buffer.
+ *
+ * The caller owns the returned descriptor and is responsible for closing it.
+ * Returns LORIE_BUFFER_NO_FD when the buffer is not backed by a shareable
+ * memory fragment (e.g. AHardwareBuffer or not yet converted).
+ */
+#define LORIE_BUFFER_NO_FD (-1)
+int LorieBuffer_exportFd(LorieBuffer* _Nullable buffer);
+
+/**
  * Lock the AHardwareBuffer for direct CPU access.
  * See AHardwareBuffer_lock() description for details
  *

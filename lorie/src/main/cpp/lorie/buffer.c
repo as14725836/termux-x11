@@ -301,6 +301,12 @@ __LIBC_HIDDEN__ const LorieBuffer_Desc* LorieBuffer_description(LorieBuffer* buf
     return buffer ? &buffer->desc : &none;
 }
 
+__LIBC_HIDDEN__ int LorieBuffer_exportFd(LorieBuffer* buffer) {
+    if (!buffer || buffer->fd < 0)
+        return LORIE_BUFFER_NO_FD;
+    return fcntl(buffer->fd, F_DUPFD_CLOEXEC, 0);
+}
+
 __LIBC_HIDDEN__ int LorieBuffer_lock(LorieBuffer* buffer, void** out) {
     int ret = 0;
     if (!buffer)

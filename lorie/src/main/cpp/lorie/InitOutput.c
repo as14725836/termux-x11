@@ -1233,10 +1233,54 @@ static int lorieDri3OpenClient(__unused ClientPtr client, __unused ScreenPtr scr
     return Success;
 }
 
+/* DRI3 fds_from_pixmap: let a client pull a server-side pixmap back out as a
+ * shm fd.  This is the mirror image of loriePixmapFromFds and is what a client
+ * needs when it wants to read pixels the server rendered (screenshots, GL
+ * readback, or a compositor that samples an X pixmap).
+ *
+ * Only shared-memory backed pixmaps can be exported here: a real DRM/GBM
+ * export would need a DRM node, which this server does not have.  Report the
+ * buffer as DRM_FORMAT_MOD_LINEAR accordingly so the client mmaps it directly,
+ * matching what loriePixmapFromFds accepts on the way back in.
+ */
+static int lorieFdsFromPixmap(__unused ScreenPtr screen, PixmapPtr pixmap, int *fds,
+                              uint32_t *strides, uint32_t *offsets, uint64_t *modifier) {
+    LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap);
+    int fd;
+
+    if (!priv || !priv->buffer) {
+        log(ERROR, "DRI3: fds_from_pixmap on a pixmap without a lorie buffer");
+        return BadAlloc;
+    }
+
+    if (priv->mem) {
+        log(ERROR, "DRI3: fds_from_pixmap on a CPU-locked pixmap");
+        return BadAlloc;
+    }
+
+    fd = LorieBuffer_exportFd(priv->buffer);
+    if (fd < 0) {
+        log(ERROR, "DRI3: pixmap buffer has no exportable fd (type %d)",
+            LorieBuffer_description(priv->buffer)->type);
+        return BadAlloc;
+    }
+
+    fds[0] = fd;
+    strides[0] = (uint32_t) pixmap->devKind;
+    offsets[0] = 0;
+    *modifier = DRM_FORMAT_MOD_LINEAR;
+
+    if (lorieServerDebugEnabled)
+        log(INFO, "DRI3: exported pixmap fd %d, %dx%d stride %u",
+            fd, pixmap->drawable.width, pixmap->drawable.height, strides[0]);
+
+    return Success;
+}
+
 static dri3_screen_info_rec lorieDri3Info = {
         .version = 2,
         .open_client = lorieDri3OpenClient,
-        .fds_from_pixmap = FalseNoop,
+        .fds_from_pixmap = lorieFdsFromPixmap,
         .pixmap_from_fds = loriePixmapFromFds,
         .get_formats = lorieGetFormats,
         .get_modifiers = lorieGetModifiers,
